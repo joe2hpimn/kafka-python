@@ -296,6 +296,7 @@ def offsets():
 def test_commit_offsets_async(mocker, coordinator, offsets):
     mocker.patch.object(coordinator._client, 'poll')
     mocker.patch.object(coordinator, 'coordinator_unknown', return_value=False)
+    mocker.patch.object(coordinator, 'ensure_coordinator_ready')
     mocker.patch.object(coordinator, '_send_offset_commit_request',
                         return_value=Future().success('fizzbuzz'))
     coordinator.commit_offsets_async(offsets)

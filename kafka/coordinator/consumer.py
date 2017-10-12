@@ -1,14 +1,13 @@
 from __future__ import absolute_import, division
 
-import copy
 import collections
+import copy
 import logging
 import time
-import weakref
 
 from kafka.vendor import six
 
-from .base import BaseCoordinator
+from .base import BaseCoordinator, Generation
 from .assignors.range import RangePartitionAssignor
 from .assignors.roundrobin import RoundRobinPartitionAssignor
 from .protocol import ConsumerProtocol
@@ -30,7 +29,7 @@ class ConsumerCoordinator(BaseCoordinator):
         'group_id': 'kafka-python-default-group',
         'enable_auto_commit': True,
         'auto_commit_interval_ms': 5000,
-        'default_offset_commit_callback': lambda offsets, response: True,
+        'default_offset_commit_callback': None,
         'assignors': (RangePartitionAssignor, RoundRobinPartitionAssignor),
         'session_timeout_ms': 30000,
         'heartbeat_interval_ms': 3000,
@@ -52,9 +51,9 @@ class ConsumerCoordinator(BaseCoordinator):
             auto_commit_interval_ms (int): milliseconds between automatic
                 offset commits, if enable_auto_commit is True. Default: 5000.
             default_offset_commit_callback (callable): called as
-                callback(offsets, response) response will be either an Exception
-                or a OffsetCommitResponse struct. This callback can be used to
-                trigger custom actions when a commit request completes.
+                callback(offsets, exception) response will be either an Exception
+                or None. This callback can be used to trigger custom actions when
+                a commit request completes.
             assignors (list): List of objects to use to distribute partition
                 ownership amongst consumer instances when group management is
                 used. Default: [RangePartitionAssignor, RoundRobinPartitionAssignor]
@@ -83,6 +82,9 @@ class ConsumerCoordinator(BaseCoordinator):
             if key in configs:
                 self.config[key] = configs[key]
 
+        if self.config['default_offset_commit_callback'] is None:
+            self.config['default_offset_commit_callback'] = self._default_offset_commit_callback
+
         if self.config['api_version'] >= (0, 9) and self.config['group_id'] is not None:
             assert self.config['assignors'], 'Coordinator requires assignors'
 
@@ -92,6 +94,7 @@ class ConsumerCoordinator(BaseCoordinator):
         self._cluster = client.cluster
         self.auto_commit_interval = self.config['auto_commit_interval_ms'] / 1000
         self.next_auto_commit_deadline = None
+        self.completed_offset_commits = collections.deque()
 
         if self.config['enable_auto_commit']:
             if self.config['api_version'] < (0, 8, 1):
@@ -252,7 +255,8 @@ class ConsumerCoordinator(BaseCoordinator):
             # essentially be ignored. See KAFKA-3949 for the complete
             # description of the problem.
             if self._subscription.subscribed_pattern:
-                self._client.ensure_fresh_metadata() # XXX
+                metadata_update = self._client.cluster.request_update()
+                self._client.poll(future=metadata_update)
 
             self.ensure_active_group()
 
@@ -391,11 +395,11 @@ class ConsumerCoordinator(BaseCoordinator):
         finally:
             super(ConsumerCoordinator, self).close()
 
-    def invoke_completed_offset_commit_callbacks(self):
+    def _invoke_completed_offset_commit_callbacks(self):
         try:
             while True:
-                completion = self.completed_offset_commits.popleft()
-                completion.invoke()
+                callback, offsets, exception = self.completed_offset_commits.popleft()
+                callback(offsets, exception)
         except IndexError:
             pass
 
@@ -409,6 +413,7 @@ class ConsumerCoordinator(BaseCoordinator):
                 struct. This callback can be used to trigger custom actions when
                 a commit request completes.
         """
+        self._invoke_completed_offset_commit_callbacks()
         if not self.coordinator_unknown():
             self._do_commit_offsets_async(offsets, callback)
         else:
@@ -422,7 +427,8 @@ class ConsumerCoordinator(BaseCoordinator):
             future = self.lookup_coordinator()
             future.add_callback(self._do_commit_offsets_async, offsets, callback)
             if callback:
-                future.add_errback(callback)
+
+                future.add_errback(lambda e: self.completed_offset_commits.appendleft((callback, offsets, e)))
 
         # ensure the commit has a chance to be transmitted (without blocking on
         # its completion). Note that commits are treated as heartbeats by the
@@ -439,7 +445,7 @@ class ConsumerCoordinator(BaseCoordinator):
             callback = self.config['default_offset_commit_callback']
         self._subscription.needs_fetch_committed_offsets = True
         future = self._send_offset_commit_request(offsets)
-        future.add_both(callback, offsets)
+        future.add_both(lambda res: self.completed_offset_commits.appendleft((callback, offsets, res)))
         return future
 
     def commit_offsets_sync(self, offsets):
@@ -457,6 +463,7 @@ class ConsumerCoordinator(BaseCoordinator):
         assert all(map(lambda k: isinstance(k, TopicPartition), offsets))
         assert all(map(lambda v: isinstance(v, OffsetAndMetadata),
                        offsets.values()))
+        self._invoke_completed_offset_commit_callbacks()
         if not offsets:
             return
 
@@ -513,23 +520,34 @@ class ConsumerCoordinator(BaseCoordinator):
                        offsets.values()))
         if not offsets:
             log.debug('No offsets to commit')
-            return Future().success(True)
+            return Future().success(None)
 
-        elif self.coordinator_unknown():
+        node_id = self.coordinator()
+        if node_id is None:
             return Future().failure(Errors.GroupCoordinatorNotAvailableError)
 
-        node_id = self.coordinator_id
 
         # create the offset commit request
         offset_data = collections.defaultdict(dict)
         for tp, offset in six.iteritems(offsets):
             offset_data[tp.topic][tp.partition] = offset
 
+        if self._subscription.partitions_auto_assigned():
+            generation = self.generation()
+        else:
+            generation = Generation.NO_GENERATION
+
+        # if the generation is None, we are not part of an active group
+        # (and we expect to be). The only thing we can do is fail the commit
+        # and let the user rejoin the group in poll()
+        if generation is None:
+            return Future().failure(Errors.CommitFailedError())
+
         if self.config['api_version'] >= (0, 9):
             request = OffsetCommitRequest[2](
                 self.group_id,
-                self.generation,
-                self.member_id,
+                generation.generation_id,
+                generation.member_id,
                 OffsetCommitRequest[2].DEFAULT_RETENTION_TIME,
                 [(
                     topic, [(
@@ -541,7 +559,9 @@ class ConsumerCoordinator(BaseCoordinator):
             )
         elif self.config['api_version'] >= (0, 8, 2):
             request = OffsetCommitRequest[1](
-                self.group_id, -1, '',
+                self.group_id,
+                generation.generation_id,
+                generation.member_id,
                 [(
                     topic, [(
                         partition,
@@ -623,7 +643,7 @@ class ConsumerCoordinator(BaseCoordinator):
                     error = error_type(self.group_id)
                     log.debug("OffsetCommit for group %s failed: %s",
                               self.group_id, error)
-                    self._subscription.mark_for_reassignment()
+                    self.reset_generation()
                     future.failure(Errors.CommitFailedError())
                     return
                 else:
@@ -638,7 +658,7 @@ class ConsumerCoordinator(BaseCoordinator):
                       unauthorized_topics, self.group_id)
             future.failure(Errors.TopicAuthorizationFailedError(unauthorized_topics))
         else:
-            future.success(True)
+            future.success(None)
 
     def _send_offset_fetch_request(self, partitions):
         """Fetch the committed offsets for a set of partitions.
@@ -657,10 +677,9 @@ class ConsumerCoordinator(BaseCoordinator):
         if not partitions:
             return Future().success({})
 
-        elif self.coordinator_unknown():
+        node_id = self.coordinator()
+        if node_id is None:
             return Future().failure(Errors.GroupCoordinatorNotAvailableError)
-
-        node_id = self.coordinator_id
 
         # Verify node is ready
         if not self._client.ready(node_id):
@@ -710,11 +729,6 @@ class ConsumerCoordinator(BaseCoordinator):
                         # re-discover the coordinator and retry
                         self.coordinator_dead(error_type())
                         future.failure(error)
-                    elif error_type in (Errors.UnknownMemberIdError,
-                                        Errors.IllegalGenerationError):
-                        # need to re-join group
-                        self._subscription.mark_for_reassignment()
-                        future.failure(error)
                     elif error_type is Errors.UnknownTopicOrPartitionError:
                         log.warning("OffsetFetchRequest -- unknown topic %s"
                                     " (have you committed any offsets yet?)",
@@ -734,50 +748,28 @@ class ConsumerCoordinator(BaseCoordinator):
                               " %s", self.group_id, tp)
         future.success(offsets)
 
+    def _default_offset_commit_callback(self, offsets, exception):
+        if exception is not None:
+            log.error("Offset commit failed: %s", exception)
 
-class AutoCommitTask(object):
-    def __init__(self, coordinator, interval):
-        self._coordinator = coordinator
-        self._client = coordinator._client
-        self._interval = interval
-
-    def reschedule(self, at=None):
-        if at is None:
-            at = time.time() + self._interval
-        self._client.schedule(self, at)
-
-    def __call__(self):
-        if self._coordinator.coordinator_unknown():
-            log.debug("Cannot auto-commit offsets for group %s because the"
-                      " coordinator is unknown", self._coordinator.group_id)
-            backoff = self._coordinator.config['retry_backoff_ms'] / 1000
-            self.reschedule(time.time() + backoff)
-            return
-
-        self._coordinator.commit_offsets_async(
-            self._coordinator._subscription.all_consumed_offsets(),
-            self._handle_commit_response)
-
-    def _handle_commit_response(self, offsets, result):
-        if result is True:
-            log.debug("Successfully auto-committed offsets for group %s",
-                      self._coordinator.group_id)
-            next_at = time.time() + self._interval
-        elif not isinstance(result, BaseException):
-            raise Errors.IllegalStateError(
-                'Unrecognized result in _handle_commit_response: %s'
-                % result)
-        elif hasattr(result, 'retriable') and result.retriable:
-            log.debug("Failed to auto-commit offsets for group %s: %s,"
-                      " will retry immediately", self._coordinator.group_id,
-                      result)
-            next_at = time.time()
-        else:
+    def _commit_offsets_async_on_complete(self, offsets, exception):
+        if exception is not None:
             log.warning("Auto offset commit failed for group %s: %s",
-                        self._coordinator.group_id, result)
-            next_at = time.time() + self._interval
+                        self.group_id, exception)
+            if getattr(exception, 'retriable', False):
+                self.next_auto_commit_deadline = min(time.time() + self.config['retry_backoff_ms'] / 1000, self.next_auto_commit_deadline)
+        else:
+            log.debug("Completed autocommit of offsets %s for group %s",
+                      offsets, self.group_id)
 
-        self.reschedule(next_at)
+    def _maybe_auto_commit_offsets_async(self):
+        if self.config['enable_auto_commit']:
+            if self.coordinator_unknown():
+                self.next_auto_commit_deadline = time.time() + self.config['retry_backoff_ms'] / 1000
+            elif time.time() > self.next_auto_commit_deadline:
+                self.next_auto_commit_deadline = time.time() + self.auto_commit_interval
+                self.commit_offsets_async(self._subscription.all_consumed_offsets(),
+                                          self._commit_offsets_async_on_complete)
 
 
 class ConsumerCoordinatorMetrics(object):

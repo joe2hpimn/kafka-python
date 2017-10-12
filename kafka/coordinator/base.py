@@ -300,7 +300,7 @@ class BaseCoordinator(object):
         with self._lock:
             if self._heartbeat_thread is not None:
                 if self._heartbeat_thread.failed:
-                    # set the heartbeat thread to null and raise an exception.
+                    # set the heartbeat thread to None and raise an exception.
                     # If the user catches it, the next call to ensure_active_group()
                     # will spawn a new heartbeat thread.
                     cause = self._heartbeat_thread.failed

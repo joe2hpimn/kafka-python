@@ -1,4 +1,4 @@
-from __future__ import absolute_import
+from __future__ import absolute_import, division
 
 import copy
 import logging
@@ -1025,8 +1025,7 @@ class KafkaConsumer(six.Iterator):
         while time.time() < self._consumer_timeout:
 
             if self._use_consumer_group():
-                self._coordinator.ensure_coordinator_ready()
-                self._coordinator.ensure_active_group()
+                self._coordinator.poll()
 
             # 0.8.2 brokers support kafka-backed offset storage via group coordinator
             elif self.config['group_id'] is not None and self.config['api_version'] >= (0, 8, 2):
@@ -1078,7 +1077,6 @@ class KafkaConsumer(six.Iterator):
 
     def _next_timeout(self):
         timeout = min(self._consumer_timeout,
-                      self._client._delayed_tasks.next_at() + time.time(),
                       self._client.cluster.ttl() / 1000.0 + time.time())
 
         # Although the delayed_tasks timeout above should cover processing

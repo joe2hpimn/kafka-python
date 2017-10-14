@@ -31,8 +31,9 @@ class ConsumerCoordinator(BaseCoordinator):
         'auto_commit_interval_ms': 5000,
         'default_offset_commit_callback': None,
         'assignors': (RangePartitionAssignor, RoundRobinPartitionAssignor),
-        'session_timeout_ms': 30000,
+        'session_timeout_ms': 10000,
         'heartbeat_interval_ms': 3000,
+        'max_poll_interval_ms': 300000,
         'retry_backoff_ms': 100,
         'api_version': (0, 9),
         'exclude_internal_topics': True,
@@ -231,11 +232,10 @@ class ConsumerCoordinator(BaseCoordinator):
 
     def poll(self):
         """
-        Poll for coordinator events. This ensures that the coordinator is known and that the consumer
-        has joined the group (if it is using group management). This also handles periodic offset commits
-        if they are enabled.
-
-        @param now current time in milliseconds
+        Poll for coordinator events. This ensures that the coordinator is
+        known and that the consumer has joined the group (if it is using
+        group management). This also handles periodic offset commits if
+        they are enabled.
         """
         self._invoke_completed_offset_commit_callbacks()
 
@@ -482,9 +482,6 @@ class ConsumerCoordinator(BaseCoordinator):
             time.sleep(self.config['retry_backoff_ms'] / 1000)
 
     def _maybe_auto_commit_offsets_sync(self):
-        if self._auto_commit_task is None:
-            return
-
         try:
             self.commit_offsets_sync(self._subscription.all_consumed_offsets())
 

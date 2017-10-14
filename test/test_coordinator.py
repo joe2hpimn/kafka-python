@@ -46,10 +46,8 @@ def test_autocommit_enable_api_version(client, api_version):
                                       group_id='foobar',
                                       api_version=api_version)
     if api_version < (0, 8, 1):
-        assert coordinator._auto_commit_task is None
         assert coordinator.config['enable_auto_commit'] is False
     else:
-        assert coordinator._auto_commit_task is not None
         assert coordinator.config['enable_auto_commit'] is True
 
 
@@ -271,13 +269,11 @@ def test_close(mocker, coordinator):
     coordinator.coordinator_id = 0
     coordinator.generation = 1
     cli = coordinator._client
-    mocker.patch.object(cli, 'unschedule')
     mocker.patch.object(cli, 'send', return_value=Future().success('foobar'))
     mocker.patch.object(cli, 'poll')
 
     coordinator.close()
     assert coordinator._maybe_auto_commit_offsets_sync.call_count == 1
-    cli.unschedule.assert_called_with(coordinator.heartbeat_task)
     coordinator._handle_leave_group_response.assert_called_with('foobar')
 
     assert coordinator.generation == -1
@@ -368,14 +364,14 @@ def test_maybe_auto_commit_offsets_sync(mocker, api_version, group_id, enable,
     commit_sync = mocker.patch.object(coordinator, 'commit_offsets_sync',
                                       side_effect=error)
     if has_auto_commit:
-        assert coordinator._auto_commit_task is not None
+        assert coordinator.next_auto_commit_deadline is not None
     else:
-        assert coordinator._auto_commit_task is None
+        assert coordinator.next_auto_commit_deadline is None
 
     assert coordinator._maybe_auto_commit_offsets_sync() is None
 
     if has_auto_commit:
-        assert coordinator._auto_commit_task is not None
+        assert coordinator.next_auto_commit_deadline is not None
 
     assert commit_sync.call_count == (1 if commit_offsets else 0)
     assert mock_warn.call_count == (1 if warn else 0)
@@ -394,7 +390,6 @@ def patched_coord(mocker, coordinator):
                         return_value=1)
     mocker.patch.object(coordinator._client, 'ready', return_value=True)
     mocker.patch.object(coordinator._client, 'send')
-    mocker.patch.object(coordinator._client, 'schedule')
     mocker.spy(coordinator, '_failed_request')
     mocker.spy(coordinator, '_handle_offset_commit_response')
     mocker.spy(coordinator, '_handle_offset_fetch_response')
@@ -589,5 +584,4 @@ def test_heartbeat(patched_coord):
     patched_coord.coordinator_unknown.return_value = True
 
     patched_coord.heartbeat_task()
-    assert patched_coord._client.schedule.call_count == 1
     assert patched_coord.heartbeat_task._handle_heartbeat_failure.call_count == 1

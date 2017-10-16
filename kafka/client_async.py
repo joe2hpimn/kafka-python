@@ -203,10 +203,12 @@ class KafkaClient(object):
         self._wake_r.setblocking(False)
         self._wake_lock = threading.Lock()
 
-        # when requests complete, they are transferred to this queue prior to
-        # invocation.
-        self._pending_completion = collections.deque()
         self._lock = threading.RLock()
+
+        # when requests complete, they are transferred to this queue prior to
+        # invocation. The purpose is to avoid invoking them while holding the
+        # lock above.
+        self._pending_completion = collections.deque()
 
         self._selector.register(self._wake_r, selectors.EVENT_READ)
         self._idle_expiry_manager = IdleConnectionManager(self.config['connections_max_idle_ms'])
@@ -527,6 +529,8 @@ class KafkaClient(object):
         Returns:
             list: responses received (can be empty)
         """
+        if future is not None:
+            timeout_ms = 100
         log.debug('Acquiring client lock for poll')
         with self._lock:
             log.debug('client poll lock acquired!')
@@ -558,18 +562,20 @@ class KafkaClient(object):
                         metadata_timeout_ms,
                         idle_connection_timeout_ms,
                         self.config['request_timeout_ms'])
-                    timeout = max(0, timeout / 1000.0)  # avoid negative timeouts
+                    timeout = max(0, timeout / 1000)  # avoid negative timeouts
 
                 self._poll(timeout)
 
-                responses.extend(self._fire_pending_completed_requests())
+            # called without the lock to avoid deadlock potential
+            # if handlers need to acquire locks
+            thread_local.responses.extend(self._fire_pending_completed_requests())
 
-                # If all we had was a timeout (future is None) - only do one poll
-                # If we do have a future, we keep looping until it is done
-                if not future or future.is_done:
-                    break
+            # If all we had was a timeout (future is None) - only do one poll
+            # If we do have a future, we keep looping until it is done
+            if not future or future.is_done:
+                break
 
-            return responses
+        return thread_local.responses
 
     def _poll(self, timeout):
         """Returns list of (response, future) tuples"""

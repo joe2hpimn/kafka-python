@@ -359,7 +359,7 @@ class BaseCoordinator(object):
                 while not self.coordinator_unknown():
                     if not self._client.in_flight_request_count(self.coordinator_id):
                         break
-                    self._client.poll(delayed_tasks=False)
+                    self._client.poll()
                 else:
                     continue
 

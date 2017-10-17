@@ -879,16 +879,20 @@ class HeartbeatThread(threading.Thread):
             while True:
                 with self.coordinator._lock:
                     if self.closed:
+                        log.debug('Heartbeat closed!')
                         return
 
                     if not self.enabled:
+                        log.debug('Heartbeat disabled. Waiting')
                         self.coordinator._lock.wait()
+                        log.debug('Heartbeat re-enabled.')
                         continue
 
                     if self.coordinator.state is not MemberState.STABLE:
                         # the group is not stable (perhaps because we left the
                         # group or because the coordinator kicked us out), so
                         # disable heartbeats and wait for the main thread to rejoin.
+                        log.debug('Group state is not stable, disabling heartbeats')
                         self.disable()
                         continue
 
@@ -914,6 +918,7 @@ class HeartbeatThread(threading.Thread):
                         # the poll timeout has expired, which means that the
                         # foreground thread has stalled in between calls to
                         # poll(), so we explicitly leave the group.
+                        log.debug('Heartbeat poll expired, leaving group')
                         self.coordinator.maybe_leave_group()
 
                     elif not self.coordinator.heartbeat.should_heartbeat():

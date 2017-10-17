@@ -511,7 +511,7 @@ class KafkaClient(object):
 
             return self._conns[node_id].send(request)
 
-    def poll(self, timeout_ms=None, future=None, delayed_tasks=True):
+    def poll(self, timeout_ms=None, future=None):
         """Try to read and write to sockets.
 
         This method will also attempt to complete node connections, refresh
@@ -529,19 +529,13 @@ class KafkaClient(object):
         """
         if future is not None:
             timeout_ms = 100
-        log.debug('Acquiring client lock for poll')
-        with self._lock:
-            log.debug('client poll lock acquired!')
-            if future is not None:
-                timeout_ms = 100
-            elif timeout_ms is None:
-                timeout_ms = self.config['request_timeout_ms']
+        elif timeout_ms is None:
+            timeout_ms = self.config['request_timeout_ms']
 
-            responses = []
-
-            # Loop for futures, break after first loop if None
-            while True:
-                log.debug('client poll loop')
+        # Loop for futures, break after first loop if None
+        responses = []
+        while True:
+            with self._lock:
 
                 # Attempt to complete pending connections
                 for node_id in list(self._connecting):
@@ -566,14 +560,14 @@ class KafkaClient(object):
 
             # called without the lock to avoid deadlock potential
             # if handlers need to acquire locks
-            thread_local.responses.extend(self._fire_pending_completed_requests())
+            responses.extend(self._fire_pending_completed_requests())
 
             # If all we had was a timeout (future is None) - only do one poll
             # If we do have a future, we keep looping until it is done
             if not future or future.is_done:
                 break
 
-        return thread_local.responses
+        return responses
 
     def _poll(self, timeout):
         """Returns list of (response, future) tuples"""

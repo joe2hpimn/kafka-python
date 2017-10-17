@@ -280,8 +280,7 @@ class BaseCoordinator(object):
         Returns:
             bool: True if it should, False otherwise
         """
-        with self._lock:
-            return self.rejoin_needed
+        return self.rejoin_needed
 
     def poll_heartbeat(self):
         """
@@ -699,8 +698,7 @@ class BaseCoordinator(object):
             self.state = MemberState.UNJOINED
 
     def request_rejoin(self):
-        with self._lock:
-            self.rejoin_needed = True
+        self.rejoin_needed = True
 
     def close(self):
         """Close the coordinator, leave the current group,

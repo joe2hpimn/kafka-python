@@ -505,9 +505,7 @@ class KafkaClient(object):
         Returns:
             Future: resolves to Response struct or Error
         """
-        log.debug('Acquiring client send lock')
         with self._lock:
-            log.debug('client send lock acquired')
             if not self._maybe_connect(node_id):
                 return Future().failure(Errors.NodeNotReadyError(node_id))
 
